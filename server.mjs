@@ -4,6 +4,10 @@ const host = process.env.JEVLOCAL_HOST ?? "127.0.0.1";
 const port = Number(process.env.JEVLOCAL_PORT ?? "9011");
 const llamaUrl = process.env.LLAMA_URL ?? "http://127.0.0.1:9030/v1/chat/completions";
 const llamaModel = process.env.LLAMA_MODEL ?? "qwen3-4b";
+const providerMode = process.env.JEVLOCAL_PROVIDER ?? "semif";
+const semifUrl = process.env.JEVLOCAL_SEMIF_URL ?? "http://127.0.0.1:9013/v1/systemone";
+const layaUrl = process.env.JEVLOCAL_LAYA_URL ?? "http://127.0.0.1:9012/v1/systemone";
+const layaProfiles = new Set((process.env.JEVLOCAL_LAYA_PROFILES ?? "").split(",").map((item) => item.trim()).filter(Boolean));
 const labels = Array.from({ length: 26 }, (_, index) => String.fromCharCode(65 + index));
 
 function isRecord(value) {
@@ -122,7 +126,7 @@ function answer(question, result) {
   return { type: 'score', score: Number(result.key), confidence: 1, legend, probabilities: Object.fromEntries(question.criteria.map((_, index) => [String(index), String(index) === result.key ? 1 : 0])) };
 }
 
-export async function systemOne(payload) {
+async function generatedSystemOne(payload) {
   const request = validateRequest(payload);
   const answers = {};
   const timings = [];
@@ -146,6 +150,78 @@ export async function systemOne(payload) {
   };
 }
 
+function requestedProfile(payload) {
+  const metadata = isRecord(payload.metadata) ? payload.metadata : {};
+  return payload.routing_profile ?? metadata.routing_profile ?? null;
+}
+
+function shouldUseLaya(payload) {
+  // Fast admission is explicit. A model confidence threshold is deliberately
+  // not used as a general-purpose quality test: it was shown task-dependent.
+  const profile = requestedProfile(payload);
+  return typeof profile === "string" && layaProfiles.has(profile);
+}
+
+async function callProvider(url, payload, provider) {
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (cause) {
+    throw error(`${provider} is unavailable: ${cause instanceof Error ? cause.message : String(cause)}`, 503);
+  }
+  let body;
+  try { body = await response.json(); } catch { throw error(`${provider} returned non-JSON output`, 502); }
+  if (!response.ok) throw error(`${provider} error: ${JSON.stringify(body).slice(0, 500)}`, response.status === 422 ? 422 : 503);
+  if (!isRecord(body.answers)) throw error(`${provider} returned no answers object`, 502);
+  return body;
+}
+
+export async function systemOne(payload) {
+  const request = validateRequest(payload);
+  if (providerMode === "generated") return generatedSystemOne(request);
+
+  const useLaya = providerMode === "laya" || (providerMode === "cascade" && shouldUseLaya(request));
+  const selected = useLaya ? { name: "laya-coreml-ane", url: layaUrl } : { name: "semif/mlx", url: semifUrl };
+  try {
+    // Laya's current Core ML service requires the optional-at-gateway model
+    // field. Keep callers JeV-compatible by supplying its local default only
+    // at that provider boundary.
+    const providerRequest = useLaya && typeof request.model !== "string"
+      ? { ...request, model: "jev-latest" }
+      : request;
+    const body = await callProvider(selected.url, providerRequest, selected.name);
+    return {
+      ...body,
+      metadata: {
+        ...(isRecord(body.metadata) ? body.metadata : {}),
+        provider: selected.name,
+        route_reason: useLaya
+          ? `explicit fast profile '${requestedProfile(request)}'`
+          : "quality default; SemIf direct option scoring",
+      },
+    };
+  } catch (cause) {
+    // An admitted fast request must still preserve availability when Laya's
+    // local model is unavailable. SemIf is the only automatic fallback.
+    if (useLaya && providerMode === "cascade") {
+      const body = await callProvider(semifUrl, request, "semif/mlx fallback");
+      return {
+        ...body,
+        metadata: {
+          ...(isRecord(body.metadata) ? body.metadata : {}),
+          provider: "semif/mlx",
+          route_reason: `Laya fast route failed; SemIf fallback (${cause instanceof Error ? cause.message : "provider error"})`,
+        },
+      };
+    }
+    throw cause;
+  }
+}
+
 function writeJson(response, status, body) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   response.end(JSON.stringify(body));
@@ -159,7 +235,11 @@ async function readJson(request) {
 
 export function createGateway() {
   return createServer(async (request, response) => {
-    if (request.method === 'GET' && request.url === '/health') return writeJson(response, 200, { status: 'ok', provider: 'llama.cpp', model: llamaModel });
+    if (request.method === 'GET' && request.url === '/health') return writeJson(response, 200, {
+      status: 'ok', provider_mode: providerMode,
+      providers: { semif: semifUrl, laya: layaUrl, generated: llamaUrl },
+      laya_profiles: [...layaProfiles],
+    });
     if (request.method === 'GET' && request.url === '/v1/models') return writeJson(response, 200, { object: 'list', data: [{ id: 'jev-latest', object: 'model', owned_by: 'jevlocal-mac' }] });
     if (request.method !== 'POST' || !['/v1/systemone', '/v1/decide'].includes(request.url)) return writeJson(response, 404, { error: { message: 'not found' } });
     try { writeJson(response, 200, await systemOne(await readJson(request))); }

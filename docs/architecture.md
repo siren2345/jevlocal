@@ -6,7 +6,9 @@ Routing must be deterministic and cheap. The gateway must not call an LLM merely
 
 ## Route policy
 
-The first release has one quality provider: the configured local llama.cpp model. This avoids semantic regex routing and avoids presenting model capability differences as API behavior.
+The quality provider is SemIf's MLX direct-option scorer over Qwen3.5-4B. It
+returns a distribution over the supplied options without generating text.
+The optional fast provider is Laya Core ML on the ANE.
 
 An optional fast provider may be added later only through a versioned task
 profile. A profile is a deterministic request matcher and a provider-specific
@@ -24,12 +26,17 @@ Every fast-provider profile requires all of the following:
    state.
 
 The initial profile registry is empty. Until a profile is validated, every
-request stays on the quality provider.
+request stays on SemIf. A request can select an enabled profile through
+`routing_profile` or `metadata.routing_profile`; the router performs no LLM
+call merely to decide where it goes. If an admitted Laya request fails at the
+provider boundary, it retries once on SemIf.
 
 ## Failure policy
 
 - Invalid Jev request: 422 with a stable API error object.
-- llama.cpp unavailable, model missing, or capacity exceeded: 503.
+- SemIf unavailable, model missing, or capacity exceeded: 503.
+- SemIf has a 16-option direct-readout limit; a larger typed choice returns 422
+  rather than being truncated.
 - Invalid model output: 502.
 
 The gateway never returns a fabricated decision or an undisclosed heuristic fallback.

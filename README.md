@@ -1,8 +1,8 @@
 # jevlocal-mac
 
-A macOS-local gateway that exposes a Jev-compatible typed-decision API and routes requests to a locally installed LLM runtime.
+A macOS-local gateway that exposes a Jev-compatible typed-decision API and routes requests to locally installed decision providers.
 
-The initial target is a llama.cpp server using Metal and a GGUF Qwen-class model. jevlocal-mac owns API compatibility, request validation, option-label encoding, result normalization, and deterministic provider routing. The model runtime owns model loading and inference.
+The default quality provider is SemIf's direct option-logit readout over Qwen3.5-4B on MLX. Laya Core ML may be admitted as an ANE fast path only for explicitly enabled, task-specific profiles. jevlocal-mac owns API compatibility, request validation, result normalization, and deterministic provider routing.
 
 ## Scope
 
@@ -20,11 +20,12 @@ It does not claim to reproduce TypeSafe Jev's model, probabilities, context beha
       -> jevlocal-mac gateway (loopback)
           -> validation and schema normalization
           -> deterministic route selection
-          -> option labels A-Z / one-token decode
-          -> llama.cpp server (loopback, Metal)
-          -> local GGUF model
+          -> SemIf provider (loopback, MLX / Qwen3.5-4B)
+          -> Laya Core ML ANE (only an enabled fast profile)
 
-The default quality route will use the local causal LLM. A future fast route may use an explicitly selected, independently evaluated provider. It will never silently substitute a heuristic or a lower-quality model.
+The quality route never silently falls back to an unvalidated heuristic. Laya is
+not selected from its confidence alone: a caller must identify a profile that
+has been independently evaluated for Laya admission.
 
 ## Quick start
 
@@ -32,33 +33,36 @@ The default quality route will use the local causal LLM. A future fast route may
 - Node.js 20+
 - Homebrew
 
-Install llama.cpp and download the pinned first provider:
+Install SemIf into a dedicated Python environment. The SemIf source is pinned
+here because its MLX backend and direct prompt are part of the provider's
+behavior.
 
 ```bash
-brew install llama.cpp
-mkdir -p models
-curl -fL -o models/Qwen3-4B-Q4_K_M.gguf \
-  https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf
+git clone https://github.com/TheoLeeCJ/SemIf.git vendor/SemIf
+git -C vendor/SemIf checkout 1f2dea3e25379f9dfc98cb83c324f00ab5deda37
+python3.12 -m venv .venv-semif
+.venv-semif/bin/pip install -e 'vendor/SemIf[mlx]'
 ```
 
-In one terminal, start the Metal runtime on loopback. Do not expose this port
-to the network.
+In one terminal, start SemIf on loopback. Its first request downloads the
+pinned Qwen3.5-4B checkpoint and quantizes it in memory to 4-bit MLX weights.
 
 ```bash
-llama-server -m models/Qwen3-4B-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 9030 --ctx-size 8192 \
-  --n-gpu-layers all --reasoning-format none --no-webui
+JEVLOCAL_PORT=9013 .venv-semif/bin/python providers/semif_server.py
 ```
 
-In a second terminal, start the JeV gateway:
+Start the Laya Core ML loopback service on port 9012 if you have an evaluated
+fast profile. Otherwise omit it; all requests stay on SemIf.
+
+In a second terminal, start the gateway:
 
 ```bash
-npm start
+JEVLOCAL_PROVIDER=cascade npm start
 ```
 
 The gateway listens at `http://127.0.0.1:9011`. Configure a different local
-runtime with `LLAMA_URL` and `LLAMA_MODEL`, or a different gateway port with
-`JEVLOCAL_PORT`.
+provider URL with `JEVLOCAL_SEMIF_URL` or `JEVLOCAL_LAYA_URL`, or a different
+gateway port with `JEVLOCAL_PORT`.
 
 ## Current API
 
@@ -85,8 +89,10 @@ structured inputs by serializing them into the local model prompt.
 
 `choice` accepts 1–26 criteria and preserves the caller's criterion keys.
 `noul` is evaluated as false/true, and `score` supports 2–10 ordered levels.
-All are a constrained, greedy one-token decode. Returned probabilities are
-therefore one-hot decisions, not calibrated confidence estimates.
+SemIf supports up to 16 options, so a 17–26 option question receives a clear
+422 response from that provider rather than a silently truncated decision.
+Its probabilities are conditional native option-logit scores, not calibrated
+Jev probabilities.
 
 Run the no-model unit checks with:
 
@@ -94,28 +100,42 @@ Run the no-model unit checks with:
 npm test
 ```
 
-## Provider profile
+## Provider routing
 
-The first supported profile is Qwen3-4B-Q4_K_M on llama.cpp Metal. On this M5
-Air (16 GB), it scored 71% on the local BBQ-100 evaluation, with a 122 ms p50
-per one-token decision and about 3.9 GB warm server RSS. See the evaluation
-documents for method and caveats.
+`JEVLOCAL_PROVIDER=semif` is the default and sends every request to SemIf.
+`JEVLOCAL_PROVIDER=cascade` enables Laya only when the caller includes a
+`routing_profile` (or `metadata.routing_profile`) whose name is present in
+`JEVLOCAL_LAYA_PROFILES`. If Laya is unavailable, that request falls back to
+SemIf. The default profile set is empty deliberately.
 
-## Planned request mapping
+For example, this enables a profile named `support-intent-v1` after it has a
+labeled admission evaluation:
+
+```bash
+JEVLOCAL_PROVIDER=cascade \
+JEVLOCAL_LAYA_PROFILES=support-intent-v1 \
+npm start
+```
+
+The public JevBench measurement is the primary compatibility benchmark; BBQ
+and 2048 remain focused diagnostic and integration tests. See
+[architecture notes](docs/architecture.md).
+
+## Generated-provider compatibility mode
 
 | Jev type | Internal decode |
 | --- | --- |
-| choice | One A-Z token, mapped back to the caller's criteria key |
-| noul | One A/B token representing false / true |
-| score | One A-J token representing score levels |
+| `JEVLOCAL_PROVIDER=generated` | llama.cpp constrained A–Z decoding |
+| `JEVLOCAL_PROVIDER=semif` | MLX direct option logits |
+| `JEVLOCAL_PROVIDER=cascade` | explicit Laya profile, otherwise SemIf |
 
-Only models that can emit the option label as their first visible output token are suitable for this runtime. Models configured to emit hidden reasoning before an answer are not compatible with single-token decoding.
+The generated mode remains a comparison provider; it is not the default route.
 
 ## Status
 
-The initial Qwen quality route is implemented. The next milestone is a
-mechanical router that adds an independently validated fast route without
-changing callers' JeV schema.
+SemIf is the quality default. The next milestone is to define and validate
+real Laya admission profiles without optimizing solely for public JevBench
+items.
 
 See [architecture notes](docs/architecture.md) and the
 [provider evaluations](docs/provider-evaluations/) for reproducible local
