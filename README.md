@@ -49,4 +49,6 @@ Only models that can emit the option label as their first visible output token a
 
 Repository initialization only. The next milestone is a reproducible local llama.cpp + Qwen installation, followed by API-contract tests and accuracy/latency measurements on this Mac.
 
-See [architecture notes](docs/architecture.md).
+See [architecture notes](docs/architecture.md) and the
+[provider evaluations](docs/provider-evaluations/) for reproducible local
+results and provider admission decisions.
