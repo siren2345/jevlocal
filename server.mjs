@@ -137,7 +137,7 @@ export function createGateway() {
     if (request.method === 'GET' && request.url === '/health') return writeJson(response, 200, {
       status: 'ok', mode: 'auto', providers: { semif: semifUrl, laya: layaUrl },
     });
-    if (request.method === 'GET' && request.url === '/v1/models') return writeJson(response, 200, { object: 'list', data: [{ id: 'jev-latest', object: 'model', owned_by: 'jevlocal-mac' }] });
+    if (request.method === 'GET' && request.url === '/v1/models') return writeJson(response, 200, { object: 'list', data: [{ id: 'jev-latest', object: 'model', owned_by: 'jevlocal' }] });
     if (request.method !== 'POST' || !['/v1/systemone', '/v1/decide'].includes(request.url)) return writeJson(response, 404, { error: { message: 'not found' } });
     try { writeJson(response, 200, await systemOne(await readJson(request))); }
     catch (cause) { writeJson(response, cause?.status ?? 500, { error: { message: cause instanceof Error ? cause.message : 'internal error' } }); }
@@ -145,5 +145,5 @@ export function createGateway() {
 }
 
 if (process.argv[1] === new URL(import.meta.url).pathname) {
-  createGateway().listen(port, host, () => console.log(`jevlocal-mac listening on http://${host}:${port}`));
+  createGateway().listen(port, host, () => console.log(`jevlocal listening on http://${host}:${port}`));
 }

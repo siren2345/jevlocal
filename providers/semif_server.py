@@ -124,7 +124,7 @@ def response(payload: dict[str, Any]) -> dict[str, Any]:
                              "confidence": probabilities[decision["key"]],
                              "legend": {str(index): value for index, value in enumerate(question["criteria"])}}
     return {
-        "model": "jevlocal-mac-semif-qwen3.5-4b-mlx-q4",
+        "model": "jevlocal-semif-qwen3.5-4b-mlx-q4",
         "answers": answers,
         "usage": {"input_tokens": input_tokens, "output_tokens": 0},
         "metadata": {

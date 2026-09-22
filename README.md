@@ -1,7 +1,10 @@
-# jevlocal-mac
+# jevlocal
 
-One command gives you a local Jev-compatible typed-decision environment on
-your Mac. No API key, no account, no configuration.
+A local, JeV-compatible typed-decision gateway. No API key, no account, no
+provider-specific client integration.
+
+The gateway and router are platform-neutral. Apple Silicon is the first
+supported deployment: it combines SemIf on MLX with Laya on Core ML / ANE.
 
 ```bash
 ./setup.sh   # once: installs the fixed decision providers
@@ -23,11 +26,11 @@ curl http://127.0.0.1:9011/v1/systemone \
 ## Concept
 
 Jev-compatible typed decisions (`choice`, `noul`, `score`) from locally
-installed providers, behind one loopback HTTP gateway. The decision engine
-is fixed: SemIf's direct option-logit readout over Qwen3.5-4B on MLX.
-A Laya Core ML fast path is tried automatically for compact inputs;
-everything else, and every fast-path failure, is answered by SemIf.
-There is nothing to configure and no provider to choose.
+installed providers, behind one loopback HTTP gateway. The gateway owns the
+schema and deterministic routing; providers own inference. On the current
+Apple deployment, SemIf's direct option-logit readout over Qwen3.5-4B on MLX
+is the quality provider, while Laya Core ML is an automatically admitted fast
+path for compact inputs.
 
 ## Laya's role
 
@@ -56,7 +59,7 @@ context behavior, or algorithms.
 ## Architecture
 
     client
-      -> jevlocal-mac gateway :9011 (loopback)
+      -> jevlocal gateway :9011 (loopback)
           -> validation and schema normalization
           -> automatic admission: compact choice -> Laya ANE :9012
           -> everything else, plus every fast-path failure -> SemIf MLX :9013
@@ -65,13 +68,16 @@ Admission is mechanical (input size, question shape), never a model call
 and never a confidence threshold. Each answer reports the provider that
 produced it in `metadata.provider` with the route reason.
 
-## Requirements
+## Apple Silicon quick start
 
 - Apple Silicon Mac
 - Node.js 20+
 - Python 3.12 (`brew install python@3.12`)
 - The Laya experiment checkout (default `/Users/ryo/jevlocal-coreml-experiment`,
   override with `LAYA_DIR=...`)
+
+Other platforms can implement the same provider boundary with SemIf CUDA or a
+different local decision provider. They are not yet setup-script-supported.
 
 ## Current API
 

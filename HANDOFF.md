@@ -1,4 +1,4 @@
-# Handoff — jevlocal-mac
+# Handoff — jevlocal
 
 Updated: 2026-09-22
 
@@ -131,7 +131,7 @@ tensors. Issue filed: https://github.com/siren2345/jev-single-decode/issues/1
 ## Verification commands
 
 ```bash
-cd /Users/ryo/jevlocal-mac
+cd /Users/ryo/jevlocal
 npm test
 curl -fsS http://127.0.0.1:9011/health
 curl -fsS http://127.0.0.1:9013/health

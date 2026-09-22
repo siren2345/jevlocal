@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-command setup for the jevlocal-mac local Jev environment.
+# One-command setup for the Apple Silicon jevlocal deployment.
 # Installs the fixed SemIf quality provider and verifies the Laya fast path.
 set -euo pipefail
 cd "$(dirname "$0")"
