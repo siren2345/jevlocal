@@ -21,6 +21,11 @@ if [ ! -d vendor/SemIf/.git ]; then
 fi
 git -C vendor/SemIf fetch --quiet origin
 git -C vendor/SemIf checkout --quiet "$SEMIF_COMMIT"
+if [ -f vendor-patches/semif-letters-26.patch ]; then
+  (cd vendor/SemIf && patch -p1 --forward --silent < ../../vendor-patches/semif-letters-26.patch || true)
+  grep -q '^LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"$' vendor/SemIf/src/semif_phase1/core.py \
+    || { echo "local LETTERS patch did not apply" >&2; exit 1; }
+fi
 echo "SemIf: $(git -C vendor/SemIf rev-parse --short HEAD) $(git -C vendor/SemIf log -1 --format=%s)"
 
 if [ ! -x .venv-semif/bin/python ]; then

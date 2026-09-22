@@ -29,6 +29,19 @@ A Laya Core ML fast path is tried automatically for compact inputs;
 everything else, and every fast-path failure, is answered by SemIf.
 There is nothing to configure and no provider to choose.
 
+## Laya's role
+
+Laya owns one job: compact intent/routing choice (single question, up to
+8 options, roughly 72 tokens or less, no reasoning-shaped text) answered
+in ~14 ms. Measured: 10/12 on such easy items; the 2 misses are
+synonym-level confusions no input shape can separate.
+
+Laya is not for games, multi-step planning, reasoning-shaped questions,
+or anything over its input budget — verified weak (2048: score ~200 vs
+SemIf ~1000, confidences near zero). Those stay on SemIf by construction.
+The 1024-token GPU bundle exists upstream but is deliberately not wired
+in: a bigger window never fixed the judgment gap in measurement.
+
 ## Scope
 
 The compatibility promise is limited to the public HTTP interface:
@@ -67,8 +80,10 @@ string or JSON-object `state` and `instructions`.
 
 `choice` accepts 1–26 criteria and preserves the caller's criterion keys.
 `noul` is evaluated as false/true, and `score` supports 2–10 ordered levels.
-SemIf supports up to 16 options, so a 17–26 option question receives a clear
-422 response from that provider rather than a silently truncated decision.
+SemIf supports up to 26 options (local A–Z extension over upstream's 16;
+see `vendor-patches/semif-letters-26.patch`), so a 27+ option question
+receives a clear 422 response from that provider rather than a silently
+truncated decision.
 Probabilities are conditional native option-logit scores, not calibrated
 Jev probabilities.
 

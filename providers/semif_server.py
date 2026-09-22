@@ -25,6 +25,10 @@ CACHE_LIMIT_MIB = int(os.environ.get("SEMIF_MLX_CACHE_LIMIT_MIB", "256"))
 MAX_INPUT_TOKENS = int(os.environ.get("SEMIF_MAX_INPUT_TOKENS", "4096"))
 
 
+def text(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
 class Provider:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -46,24 +50,24 @@ class Provider:
         kind = question.get("type")
         criteria = question.get("criteria")
         if kind == "choice":
-            if not isinstance(criteria, dict) or not 1 <= len(criteria) <= 16:
-                raise ValueError("choice criteria must contain 1 to 16 options")
+            if not isinstance(criteria, dict) or not 1 <= len(criteria) <= 26:
+                raise ValueError("choice criteria must contain 1 to 26 options")
             keys = list(criteria)
-            return keys, [{"id": key, "description": f"{key}: {criteria[key]}"} for key in keys]
+            return keys, [{"id": key, "description": f"{key}: {text(criteria[key])}"} for key in keys]
         if kind == "noul":
             if criteria is not None and not isinstance(criteria, dict):
                 raise ValueError("noul criteria must be an object when supplied")
             criteria = criteria or {}
             return ["false", "true"], [
-                {"id": "false", "description": f"false: {criteria.get('false', 'The proposition is false.')}"},
-                {"id": "true", "description": f"true: {criteria.get('true', 'The proposition is true.')}"},
+                {"id": "false", "description": f"false: {text(criteria.get('false', 'The proposition is false.'))}"},
+                {"id": "true", "description": f"true: {text(criteria.get('true', 'The proposition is true.'))}"},
             ]
         if kind == "score":
             if not isinstance(criteria, list) or not 2 <= len(criteria) <= 10:
                 raise ValueError("score criteria must contain 2 to 10 ordered levels")
             keys = [str(index) for index in range(len(criteria))]
             return keys, [
-                {"id": key, "description": f"{key}: {criterion}"}
+                {"id": key, "description": f"{key}: {text(criterion)}"}
                 for key, criterion in zip(keys, criteria)
             ]
         raise ValueError("question type must be choice, noul, or score")
@@ -72,7 +76,10 @@ class Provider:
         keys, options = self.options(question)
         if len(keys) == 1:
             return {"key": keys[0], "probabilities": {keys[0]: 1.0}, "input_tokens": 0, "inference_ms": 0.0}
-        row = {"id": request_id, "state": state, "question": question.get("instructions", ""), "options": options}
+        instructions = question.get("instructions", "")
+        if not isinstance(instructions, str):
+            instructions = json.dumps(instructions, ensure_ascii=False)
+        row = {"id": request_id, "state": state, "question": instructions, "options": options}
         with self._lock:
             model, tokenizer, metadata = self.load()
             started = time.perf_counter()
