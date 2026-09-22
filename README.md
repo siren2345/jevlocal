@@ -1,8 +1,33 @@
 # jevlocal-mac
 
-A macOS-local gateway that exposes a Jev-compatible typed-decision API and routes requests to locally installed decision providers.
+One command gives you a local Jev-compatible typed-decision environment on
+your Mac. No API key, no account, no configuration.
 
-The default quality provider is SemIf's direct option-logit readout over Qwen3.5-4B on MLX. Laya Core ML may be admitted as an ANE fast path only for explicitly enabled, task-specific profiles. jevlocal-mac owns API compatibility, request validation, result normalization, and deterministic provider routing.
+```bash
+./setup.sh   # once: installs the fixed decision providers
+./run.sh     # every time: starts everything, gateway on http://127.0.0.1:9011
+```
+
+Then decide:
+
+```bash
+curl http://127.0.0.1:9011/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{"state": {"ticket": "The customer was charged twice."},
+       "questions": {"route": {"type": "choice",
+         "instructions": {"task": "Choose the support team."},
+         "criteria": {"billing": "Payment or duplicate charge issue",
+                      "technical": "Application malfunction"}}}}'
+```
+
+## Concept
+
+Jev-compatible typed decisions (`choice`, `noul`, `score`) from locally
+installed providers, behind one loopback HTTP gateway. The decision engine
+is fixed: SemIf's direct option-logit readout over Qwen3.5-4B on MLX.
+A Laya Core ML fast path is tried automatically for compact inputs;
+everything else, and every fast-path failure, is answered by SemIf.
+There is nothing to configure and no provider to choose.
 
 ## Scope
 
@@ -12,86 +37,39 @@ The compatibility promise is limited to the public HTTP interface:
 - Jev-shaped choice, noul, and score request/response schema
 - Choice criteria keys preserved exactly
 
-It does not claim to reproduce TypeSafe Jev's model, probabilities, context behavior, or algorithms.
+It does not claim to reproduce TypeSafe Jev's model, probabilities,
+context behavior, or algorithms.
 
 ## Architecture
 
     client
-      -> jevlocal-mac gateway (loopback)
+      -> jevlocal-mac gateway :9011 (loopback)
           -> validation and schema normalization
-          -> deterministic route selection
-          -> SemIf provider (loopback, MLX / Qwen3.5-4B)
-          -> Laya Core ML ANE (only an enabled fast profile)
+          -> automatic admission: compact choice -> Laya ANE :9012
+          -> everything else, plus every fast-path failure -> SemIf MLX :9013
 
-The quality route never silently falls back to an unvalidated heuristic. Laya is
-not selected from its confidence alone: a caller must identify a profile that
-has been independently evaluated for Laya admission.
+Admission is mechanical (input size, question shape), never a model call
+and never a confidence threshold. Each answer reports the provider that
+produced it in `metadata.provider` with the route reason.
 
-## Quick start
+## Requirements
 
 - Apple Silicon Mac
 - Node.js 20+
-- Homebrew
-
-Install SemIf into a dedicated Python environment. The SemIf source is pinned
-here because its MLX backend and direct prompt are part of the provider's
-behavior.
-
-```bash
-git clone https://github.com/TheoLeeCJ/SemIf.git vendor/SemIf
-git -C vendor/SemIf checkout 1f2dea3e25379f9dfc98cb83c324f00ab5deda37
-python3.12 -m venv .venv-semif
-.venv-semif/bin/pip install -e 'vendor/SemIf[mlx]'
-```
-
-In one terminal, start SemIf on loopback. Its first request downloads the
-pinned Qwen3.5-4B checkpoint and quantizes it in memory to 4-bit MLX weights.
-
-```bash
-JEVLOCAL_PORT=9013 .venv-semif/bin/python providers/semif_server.py
-```
-
-Start the Laya Core ML loopback service on port 9012 if you have an evaluated
-fast profile. Otherwise omit it; all requests stay on SemIf.
-
-In a second terminal, start the gateway:
-
-```bash
-JEVLOCAL_PROVIDER=cascade npm start
-```
-
-The gateway listens at `http://127.0.0.1:9011`. Configure a different local
-provider URL with `JEVLOCAL_SEMIF_URL` or `JEVLOCAL_LAYA_URL`, or a different
-gateway port with `JEVLOCAL_PORT`.
+- Python 3.12 (`brew install python@3.12`)
+- The Laya experiment checkout (default `/Users/ryo/jevlocal-coreml-experiment`,
+  override with `LAYA_DIR=...`)
 
 ## Current API
 
-`POST /v1/systemone` and `POST /v1/decide` accept a JeV-shaped request. The
-gateway accepts string or JSON-object `state` and `instructions`, preserving
-structured inputs by serializing them into the local model prompt.
-
-```json
-{
-  "model": "jev-latest",
-  "state": { "ticket": "The customer was charged twice." },
-  "questions": {
-    "route": {
-      "type": "choice",
-      "instructions": { "task": "Choose the support team." },
-      "criteria": {
-        "billing": "Payment or duplicate charge issue",
-        "technical": "Application malfunction"
-      }
-    }
-  }
-}
-```
+`POST /v1/systemone` and `POST /v1/decide` accept a JeV-shaped request with
+string or JSON-object `state` and `instructions`.
 
 `choice` accepts 1–26 criteria and preserves the caller's criterion keys.
 `noul` is evaluated as false/true, and `score` supports 2–10 ordered levels.
 SemIf supports up to 16 options, so a 17–26 option question receives a clear
 422 response from that provider rather than a silently truncated decision.
-Its probabilities are conditional native option-logit scores, not calibrated
+Probabilities are conditional native option-logit scores, not calibrated
 Jev probabilities.
 
 Run the no-model unit checks with:
@@ -100,43 +78,23 @@ Run the no-model unit checks with:
 npm test
 ```
 
-## Provider routing
-
-`JEVLOCAL_PROVIDER=semif` is the default and sends every request to SemIf.
-`JEVLOCAL_PROVIDER=cascade` enables Laya only when the caller includes a
-`routing_profile` (or `metadata.routing_profile`) whose name is present in
-`JEVLOCAL_LAYA_PROFILES`. If Laya is unavailable, that request falls back to
-SemIf. The default profile set is empty deliberately.
-
-For example, this enables a profile named `support-intent-v1` after it has a
-labeled admission evaluation:
+Evaluate the whole gateway against the vendored public JevBench fixture:
 
 ```bash
-JEVLOCAL_PROVIDER=cascade \
-JEVLOCAL_LAYA_PROFILES=support-intent-v1 \
-npm start
+node scripts/run-jevbench-public.mjs
 ```
-
-The public JevBench measurement is the primary compatibility benchmark; BBQ
-and 2048 remain focused diagnostic and integration tests. See
-[architecture notes](docs/architecture.md).
-
-## Generated-provider compatibility mode
-
-| Jev type | Internal decode |
-| --- | --- |
-| `JEVLOCAL_PROVIDER=generated` | llama.cpp constrained A–Z decoding |
-| `JEVLOCAL_PROVIDER=semif` | MLX direct option logits |
-| `JEVLOCAL_PROVIDER=cascade` | explicit Laya profile, otherwise SemIf |
-
-The generated mode remains a comparison provider; it is not the default route.
 
 ## Status
 
-SemIf is the quality default. The next milestone is to define and validate
-real Laya admission profiles without optimizing solely for public JevBench
-items.
+Measured 2026-09-22 on an M5 Air (16 GB), all through this gateway:
 
-See [architecture notes](docs/architecture.md) and the
-[provider evaluations](docs/provider-evaluations/) for reproducible local
-results and provider admission decisions.
+- Public JevBench, full auto routing: 174 / 231 (easy 48/48, original
+  68/72, hard 58/111), 0 errors
+- Same fixture, SemIf-only equivalent: 48/48 easy; auto routing trades
+  2 easy items (Laya fast-path misses) for ~14 ms answers on compact
+  inputs vs ~205 ms on SemIf
+- Laya direct, easy only: 41 / 48 at p50 14 ms; 3 requests refused by
+  its 96-token input cap
+
+See [architecture notes](docs/architecture.md) and
+[provider evaluations](docs/provider-evaluations/) for method and caveats.

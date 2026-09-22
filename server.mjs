@@ -2,13 +2,15 @@ import { createServer } from "node:http";
 
 const host = process.env.JEVLOCAL_HOST ?? "127.0.0.1";
 const port = Number(process.env.JEVLOCAL_PORT ?? "9011");
-const llamaUrl = process.env.LLAMA_URL ?? "http://127.0.0.1:9030/v1/chat/completions";
-const llamaModel = process.env.LLAMA_MODEL ?? "qwen3-4b";
-const providerMode = process.env.JEVLOCAL_PROVIDER ?? "semif";
 const semifUrl = process.env.JEVLOCAL_SEMIF_URL ?? "http://127.0.0.1:9013/v1/systemone";
 const layaUrl = process.env.JEVLOCAL_LAYA_URL ?? "http://127.0.0.1:9012/v1/systemone";
-const layaProfiles = new Set((process.env.JEVLOCAL_LAYA_PROFILES ?? "").split(",").map((item) => item.trim()).filter(Boolean));
-const labels = Array.from({ length: 26 }, (_, index) => String.fromCharCode(65 + index));
+
+// Automatic fast-path admission. Mechanical rules only: no model calls to
+// decide routing, no confidence thresholds. Anything not admitted goes to
+// SemIf, and any Laya failure falls back to SemIf.
+const LAYA_TOKEN_CAP = 72; // 75% of the ANE 96-token export limit; chars/4 estimate
+const LAYA_MAX_OPTIONS = 8;
+const REASONING = /\b(explain|reason(?:ing)?|justify|infer(?:ence)?|ambig(?:uous|uity)|bias|stereotyp(?:e|ical)|according to the passage|can(?:not|'t) be determined|cannot answer|not answerable|undetermined|unknown|not known|uncertain|not enough (?:information|info)|insufficient information|none of the above)\b|理由|根拠|推論|曖昧|偏見|判断不能|不明|わからない|情報不足/i;
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -46,120 +48,29 @@ export function validateRequest(body) {
   return body;
 }
 
-function choiceShape(question) {
-  if (question.type === 'choice') {
-    const keys = Object.keys(question.criteria);
-    return { keys, options: keys.map((key) => asText(question.criteria[key])) };
+function estimateTokens(request) {
+  const parts = [asText(request.state)];
+  for (const question of Object.values(request.questions)) {
+    parts.push(asText(question.instructions ?? ''));
+    parts.push(asText(question.criteria ?? ''));
   }
-  if (question.type === 'noul') {
-    const criteria = question.criteria ?? {};
-    return { keys: ['false', 'true'], options: [asText(criteria.false ?? 'No, the condition is false.'), asText(criteria.true ?? 'Yes, the condition is true.')] };
-  }
-  return { keys: question.criteria.map((_, index) => String(index)), options: question.criteria.map(asText) };
+  const chars = parts.join('\n').length;
+  return Math.ceil(chars / 4);
 }
 
-function buildPrompt(state, question, options) {
-  const text = options.map((option, index) => `${labels[index]}. ${option}`).join('\n');
-  return [
-    'Make one typed decision from the supplied state and instructions.',
-    'Use only the supplied state as evidence. Do not add unstated assumptions.',
-    '',
-    `STATE:\n${asText(state)}`,
-    '',
-    `INSTRUCTIONS:\n${asText(question.instructions ?? '')}`,
-    '',
-    `OPTIONS:\n${text}`,
-    '',
-    'Return only the option label.',
-  ].join('\n');
-}
-
-function grammar(optionLabels) {
-  return `root ::= ${optionLabels.map(JSON.stringify).join(' | ')}`;
-}
-
-function decodeLabel(content, optionLabels) {
-  const last = [...content].reverse().find((character) => optionLabels.includes(character));
-  if (!last) throw error('upstream returned no constrained option label', 502);
-  return last;
-}
-
-async function decide(state, question) {
-  const { keys, options } = choiceShape(question);
-  const optionLabels = labels.slice(0, keys.length);
-  const started = performance.now();
-  let response;
-  try {
-    response = await fetch(llamaUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: llamaModel,
-        messages: [{ role: 'user', content: buildPrompt(state, question, options) }],
-        temperature: 0,
-        max_tokens: 1,
-        grammar: grammar(optionLabels),
-        // Qwen3's current template can emit an empty think wrapper. The
-        // constrained label remains the final visible character and is decoded above.
-        chat_template_kwargs: { enable_thinking: false },
-      }),
-    });
-  } catch (cause) {
-    throw error(`llama.cpp is unavailable: ${cause instanceof Error ? cause.message : String(cause)}`, 503);
-  }
-  const elapsed = Number((performance.now() - started).toFixed(1));
-  let body;
-  try { body = await response.json(); } catch { throw error('llama.cpp returned non-JSON output', 502); }
-  if (!response.ok) throw error(`llama.cpp error: ${JSON.stringify(body).slice(0, 500)}`, 502);
-  const label = decodeLabel(body.choices?.[0]?.message?.content ?? '', optionLabels);
-  const index = optionLabels.indexOf(label);
-  return { key: keys[index], elapsed, inputTokens: body.usage?.prompt_tokens ?? 0 };
-}
-
-function answer(question, result) {
-  if (question.type === 'choice') {
-    const probabilities = Object.fromEntries(Object.keys(question.criteria).map((key) => [key, key === result.key ? 1 : 0]));
-    return { type: 'choice', choice: result.key, probabilities, confidence: 1 };
-  }
-  if (question.type === 'noul') return { type: 'noul', noul: result.key === 'true' ? 1 : 0 };
-  const legend = Object.fromEntries(question.criteria.map((item, index) => [String(index), asText(item)]));
-  return { type: 'score', score: Number(result.key), confidence: 1, legend, probabilities: Object.fromEntries(question.criteria.map((_, index) => [String(index), String(index) === result.key ? 1 : 0])) };
-}
-
-async function generatedSystemOne(payload) {
-  const request = validateRequest(payload);
-  const answers = {};
-  const timings = [];
-  let inputTokens = 0;
-  for (const [name, question] of Object.entries(request.questions)) {
-    const result = await decide(request.state, question);
-    answers[name] = answer(question, result);
-    timings.push(result.elapsed);
-    inputTokens += result.inputTokens;
-  }
-  return {
-    model: 'jevlocal-mac-qwen3-4b-q4-k-m',
-    answers,
-    usage: { input_tokens: inputTokens, output_tokens: Object.keys(answers).length },
-    metadata: {
-      provider: 'llama.cpp/Qwen3-4B-Q4_K_M',
-      route_reason: 'quality-default',
-      probabilities: 'Deterministic constrained greedy decisions, not calibrated probabilities.',
-      performance: { inference_ms: Number(timings.reduce((total, value) => total + value, 0).toFixed(1)), per_question_ms: timings },
-    },
-  };
-}
-
-function requestedProfile(payload) {
-  const metadata = isRecord(payload.metadata) ? payload.metadata : {};
-  return payload.routing_profile ?? metadata.routing_profile ?? null;
-}
-
-function shouldUseLaya(payload) {
-  // Fast admission is explicit. A model confidence threshold is deliberately
-  // not used as a general-purpose quality test: it was shown task-dependent.
-  const profile = requestedProfile(payload);
-  return typeof profile === "string" && layaProfiles.has(profile);
+export function admission(request) {
+  // Returns { provider: 'laya'|'semif', reason } — pure function of the request.
+  const names = Object.keys(request.questions);
+  if (names.length !== 1) return { provider: 'semif', reason: 'multi-question requests stay on the quality provider' };
+  const question = request.questions[names[0]];
+  if (question.type !== 'choice') return { provider: 'semif', reason: `${question.type} stays on the quality provider` };
+  const options = Object.keys(question.criteria).length;
+  if (options > LAYA_MAX_OPTIONS) return { provider: 'semif', reason: `${options} options exceed the fast-path limit` };
+  const text = [asText(request.state), asText(question.instructions ?? ''), Object.values(question.criteria).map(asText).join(' ')].join('\n');
+  if (REASONING.test(text)) return { provider: 'semif', reason: 'reasoning-shaped input stays on the quality provider' };
+  const tokens = estimateTokens(request);
+  if (tokens > LAYA_TOKEN_CAP) return { provider: 'semif', reason: `~${tokens} tokens exceed the fast-path budget` };
+  return { provider: 'laya', reason: `compact choice (~${tokens} tokens, ${options} options)` };
 }
 
 async function callProvider(url, payload, provider) {
@@ -180,46 +91,34 @@ async function callProvider(url, payload, provider) {
   return body;
 }
 
+function tag(body, provider, reason) {
+  return {
+    ...body,
+    metadata: {
+      ...(isRecord(body.metadata) ? body.metadata : {}),
+      provider,
+      route_reason: reason,
+    },
+  };
+}
+
 export async function systemOne(payload) {
   const request = validateRequest(payload);
-  if (providerMode === "generated") return generatedSystemOne(request);
-
-  const useLaya = providerMode === "laya" || (providerMode === "cascade" && shouldUseLaya(request));
-  const selected = useLaya ? { name: "laya-coreml-ane", url: layaUrl } : { name: "semif/mlx", url: semifUrl };
-  try {
-    // Laya's current Core ML service requires the optional-at-gateway model
-    // field. Keep callers JeV-compatible by supplying its local default only
-    // at that provider boundary.
-    const providerRequest = useLaya && typeof request.model !== "string"
-      ? { ...request, model: "jev-latest" }
-      : request;
-    const body = await callProvider(selected.url, providerRequest, selected.name);
-    return {
-      ...body,
-      metadata: {
-        ...(isRecord(body.metadata) ? body.metadata : {}),
-        provider: selected.name,
-        route_reason: useLaya
-          ? `explicit fast profile '${requestedProfile(request)}'`
-          : "quality default; SemIf direct option scoring",
-      },
-    };
-  } catch (cause) {
-    // An admitted fast request must still preserve availability when Laya's
-    // local model is unavailable. SemIf is the only automatic fallback.
-    if (useLaya && providerMode === "cascade") {
+  const route = admission(request);
+  if (route.provider === 'laya') {
+    try {
+      const requestWithModel = typeof request.model !== "string"
+        ? { ...request, model: "jev-latest" }
+        : request;
+      const body = await callProvider(layaUrl, requestWithModel, "laya-coreml-ane");
+      return tag(body, "laya-coreml-ane", `fast path: ${route.reason}`);
+    } catch (cause) {
       const body = await callProvider(semifUrl, request, "semif/mlx fallback");
-      return {
-        ...body,
-        metadata: {
-          ...(isRecord(body.metadata) ? body.metadata : {}),
-          provider: "semif/mlx",
-          route_reason: `Laya fast route failed; SemIf fallback (${cause instanceof Error ? cause.message : "provider error"})`,
-        },
-      };
+      return tag(body, "semif/mlx", `fast path failed; quality fallback (${cause instanceof Error ? cause.message : "provider error"})`);
     }
-    throw cause;
   }
+  const body = await callProvider(semifUrl, request, "semif/mlx");
+  return tag(body, "semif/mlx", `quality default: ${route.reason}`);
 }
 
 function writeJson(response, status, body) {
@@ -236,9 +135,7 @@ async function readJson(request) {
 export function createGateway() {
   return createServer(async (request, response) => {
     if (request.method === 'GET' && request.url === '/health') return writeJson(response, 200, {
-      status: 'ok', provider_mode: providerMode,
-      providers: { semif: semifUrl, laya: layaUrl, generated: llamaUrl },
-      laya_profiles: [...layaProfiles],
+      status: 'ok', mode: 'auto', providers: { semif: semifUrl, laya: layaUrl },
     });
     if (request.method === 'GET' && request.url === '/v1/models') return writeJson(response, 200, { object: 'list', data: [{ id: 'jev-latest', object: 'model', owned_by: 'jevlocal-mac' }] });
     if (request.method !== 'POST' || !['/v1/systemone', '/v1/decide'].includes(request.url)) return writeJson(response, 404, { error: { message: 'not found' } });
